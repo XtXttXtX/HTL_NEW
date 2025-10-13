@@ -1,7 +1,7 @@
 import torch
 import argparse
 from models.bilstm_encoder import BiLSTMEncoder
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader,Subset
 from dataset_railway import RailwayDataset
 from models.ddfn import DDFN  # 我们后面要补充 DDFN
 from models.decoder import Decoder  # 我们后面要补充 Decoder
@@ -77,13 +77,49 @@ def main(opt):
     # 加载预训练的 BiLSTM 模型
     model = load_pretrained_model(opt.pretrained_model_path, device)
 
-    # ⚠️ window_size 和 stride 可以根据你实际设定传入
-    railway_dataset = WindowedRailwayDataset(
-        data_dir=opt.data_path,
-        fault_range_file="fault_ranges.xlsx",  # 请确保路径正确
-        window_size=60,
-        stride=20
-    )
+    # ⚠️ 根据是否启用 split-by-time 选择数据集划分方式
+    if opt.split_by_time:
+        print("🕒 启用按时间比例 (6:2:2) 划分 train/val/test ...")
+
+        # 三个数据集分别使用 split='train'/'val'/'test'
+        train_dataset = WindowedRailwayDataset(
+            data_dir=opt.data_path,
+            fault_range_file="fault_ranges.xlsx",
+            window_size=60,
+            stride=20,
+            split="train",
+            split_by_time=True,
+            ratios=tuple(opt.ratios)
+        )
+        val_dataset = WindowedRailwayDataset(
+            data_dir=opt.data_path,
+            fault_range_file="fault_ranges.xlsx",
+            window_size=60,
+            stride=20,
+            split="val",
+            split_by_time=True,
+            ratios=tuple(opt.ratios)
+        )
+    else:
+        print("🎲 使用原始随机划分方式 ...")
+        # 原逻辑保持不变
+        railway_dataset = WindowedRailwayDataset(
+            data_dir=opt.data_path,
+            fault_range_file="fault_ranges.xlsx",
+            window_size=60,
+            stride=20
+        )
+
+        # 按标签分层随机划分
+        indices = list(range(len(railway_dataset)))
+        labels = railway_dataset.labels
+        from sklearn.model_selection import train_test_split
+        train_idx, val_idx = train_test_split(indices, test_size=0.2,
+                                              stratify=labels, random_state=42)
+        from torch.utils.data import Subset
+        train_dataset = Subset(railway_dataset, train_idx)
+        val_dataset = Subset(railway_dataset, val_idx)
+
     #初始化 EarlyStopping 状态变量
     best_val_f1 = 0.0  # 当前观察到的最佳验证集 F1
     no_improve_epochs = 0  # 连续未提升的 epoch 计数器
@@ -109,8 +145,23 @@ def main(opt):
     train_subset = Subset(railway_dataset, train_idx)
     val_subset = Subset(railway_dataset, val_idx)
 
-    train_loader = DataLoader(train_subset, batch_size=opt.batch_size, shuffle=True)
-    val_loader = DataLoader(val_subset, batch_size=opt.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False)
+
+    # 加入test数据加载，这样在训练结束后能直接在test_loader上评估最终性能
+    # 如果启用了 split-by-time，可以直接构建 test_dataset
+    if opt.split_by_time:
+        test_dataset = WindowedRailwayDataset(
+            data_dir=opt.data_path,
+            fault_range_file="fault_ranges.xlsx",
+            window_size=60,
+            stride=20,
+            split="test",
+            split_by_time=True,
+            ratios=tuple(opt.ratios)
+        )
+        test_loader = DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False)
+        print(f"✅ 测试集样本数: {len(test_dataset)}")
 
     # 创建 DDFN 模块（特征对齐）
     ddfn = DDFN().to(device)
@@ -251,6 +302,10 @@ if __name__ == '__main__':
     parser.add_argument('--wandb-log', action='store_true', help='Log rsults to WandB')
     parser.add_argument('--early-stop-patience', type=int, default=1000,
                         help='验证集 F1 连续多少个 epoch 无提升则提前终止训练（EarlyStopping）')
+    parser.add_argument('--split-by-time', action='store_true',
+                        help='在每个 Excel 内按时间比例 (6:2:2) 划分 train/val/test')
+    parser.add_argument('--ratios', type=float, nargs=3, default=[0.6, 0.2, 0.2],
+                        help='train/val/test 比例，仅在 --split-by-time 启用时有效')
 
     opt = parser.parse_args()
     main(opt)
