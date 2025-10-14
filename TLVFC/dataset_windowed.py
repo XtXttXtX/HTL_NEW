@@ -10,9 +10,11 @@ USEFUL_COLUMNS = [
 ]
 
 class WindowedRailwayDataset(Dataset):
-    def __init__(self, data_dir, fault_range_file, window_size=60, stride=20,split: str = "train",          # 标记当前数据集：'train'/'val'/'test'
-split_by_time: bool = False,
-ratios=(0.6, 0.2, 0.2) ):
+    def __init__(self, data_dir, fault_range_file,
+                 window_size=60, stride=20,
+                 split: str = "train",          # 标记当前数据集：'train'/'val'/'test'
+                 split_by_time: bool = False,
+                 ratios=(0.6, 0.2, 0.2) ):
         self.samples = []
         self.labels = []
         self.label_map = {}
@@ -54,7 +56,7 @@ ratios=(0.6, 0.2, 0.2) ):
                 selected_cols = [col for col in df.columns if col in USEFUL_COLUMNS]
                 data = df[selected_cols].dropna().astype(np.float32).values  # shape: [T, 8]
                 T = len(data) #得到当前这段时序的总长度（行数）
-                if T < window_size:
+                if T < self.window_size:
                     # 行数少于一个窗口，跳过本文件
                     continue
 
@@ -78,16 +80,16 @@ ratios=(0.6, 0.2, 0.2) ):
                     data_seg = data
 
                 # === 下面改成对 data_seg 做滑窗（把你原先 for 循环里的 data 替换为 data_seg）===
-                for i in range(0, len(data_seg) - window_size + 1, stride):
-                    window = data_seg[i:i + window_size]  # [window_size, 8]
+                for i in range(0, len(data_seg) - self.window_size + 1, self.stride):
+                    window = data_seg[i:i + self.window_size]  # [window_size, 8]
                     self.samples.append((torch.tensor(window, dtype=torch.float32), label))
                     self.labels.append(label)
 
                 # 滑窗
-                for i in range(0, len(data) - window_size + 1, stride):
-                    window = data[i:i + window_size]
-                    self.samples.append((torch.tensor(window, dtype=torch.float32), label))
-                    self.labels.append(label)
+                #for i in range(0, len(data) - window_size + 1, stride):
+                    #window = data[i:i + window_size]
+                    #self.samples.append((torch.tensor(window, dtype=torch.float32), label))
+                    #self.labels.append(label)
 
             # ✅ 文件夹读取完之后，统计该类的样本数量
             count_for_label = sum(1 for l in self.labels if l == label)

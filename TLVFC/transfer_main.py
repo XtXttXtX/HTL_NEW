@@ -8,6 +8,8 @@ from models.decoder import Decoder  # 我们后面要补充 Decoder
 from torch.optim import Adam
 from models.decoder_full import DecoderFull
 from dataset_windowed import WindowedRailwayDataset
+from collections import Counter
+
 
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Subset
@@ -66,6 +68,8 @@ def load_pretrained_model(model_path, device):
 
 
 def main(opt):
+    # ✅ 初始化占位，防止 test_dataset 未定义
+    test_dataset = None
     # 初始化 wandb（如果需要）
     if opt.wandb_log:
         wandb.init(project="RUL迁移学习", name="源模型迁移")
@@ -109,41 +113,62 @@ def main(opt):
             window_size=60,
             stride=20
         )
-
         # 按标签分层随机划分
+        # === 仅在随机划分路径（else 分支）里使用 ===
+
+        # 1) 取全部样本索引与标签（避免与批内的 labels 重名，换个名字）
         indices = list(range(len(railway_dataset)))
-        labels = railway_dataset.labels
+        labels_all = railway_dataset.labels
+
+        # 2) 分层随机划分
+        #   （如果已在文件顶部 import 过，就把这两行 import 去掉）
         from sklearn.model_selection import train_test_split
-        train_idx, val_idx = train_test_split(indices, test_size=0.2,
-                                              stratify=labels, random_state=42)
+        train_idx, val_idx = train_test_split(
+            indices, test_size=0.2, stratify=labels_all, random_state=42
+        )
+
+        # 3) 构建子集作为数据集（注意：这里就直接叫 train_dataset / val_dataset）
         from torch.utils.data import Subset
         train_dataset = Subset(railway_dataset, train_idx)
         val_dataset = Subset(railway_dataset, val_idx)
+
+        # 4) 随机划分路径没有 test 集，明确置空，后面评估时可判空
+        test_dataset = None
 
     #初始化 EarlyStopping 状态变量
     best_val_f1 = 0.0  # 当前观察到的最佳验证集 F1
     no_improve_epochs = 0  # 连续未提升的 epoch 计数器
     early_stop_patience = opt.early_stop_patience
 
-    # 按标签分层划分（stratify），保证各类别比例一致
-    indices = list(range(len(railway_dataset)))
-    labels = railway_dataset.labels
-    train_idx, val_idx = train_test_split(
-        indices, test_size=0.2, stratify=labels, random_state=42
-    )
-    from collections import Counter
+    # —— 通用：从任意数据集对象提取标签列表（兼容 Subset 和自定义 Dataset）——
+    def get_labels_from_dataset(ds):
+        # 1) Subset 的情况：用 indices 在底层 dataset.labels 里索引
+        try:
+            from torch.utils.data import Subset
+            if isinstance(ds, Subset) and hasattr(ds.dataset, "labels"):
+                return [ds.dataset.labels[i] for i in ds.indices]
+        except Exception:
+            pass
+        # 2) 自定义 WindowedRailwayDataset：直接有 labels
+        if hasattr(ds, "labels"):
+            return list(ds.labels)
+        # 3) 兜底：从 dataset 迭代拿（慢，但通用）
+        return [y for _, y in ds]
 
-    train_labels = [labels[i] for i in train_idx]
-    val_labels = [labels[i] for i in val_idx]
+    train_labels = get_labels_from_dataset(train_dataset)
+    val_labels = get_labels_from_dataset(val_dataset)
 
     print("\n📊 训练集标签分布:")
     print(Counter(train_labels))
 
     print("\n📊 验证集标签分布:")
     print(Counter(val_labels))
+    if test_dataset is not None:
+        test_labels = get_labels_from_dataset(test_dataset)
+        print("\n📊 测试集标签分布:")
+        print(Counter(test_labels))
 
-    train_subset = Subset(railway_dataset, train_idx)
-    val_subset = Subset(railway_dataset, val_idx)
+
 
     train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False)
@@ -169,7 +194,13 @@ def main(opt):
 
 
     # 定义优化器和损失函数
-    optimizer = Adam(decoder.parameters(), lr=opt.lr)
+    for p in model.parameters():
+        p.requires_grad = False  # 冻结 BiLSTM encoder
+
+    ddfn.train()
+    decoder.train()
+
+    optimizer = Adam(list(ddfn.parameters()) + list(decoder.parameters()), lr=opt.lr)
     criterion = torch.nn.CrossEntropyLoss()
 
     # 训练过程
@@ -230,8 +261,15 @@ def main(opt):
         if f1_val > best_val_f1:
             best_val_f1 = f1_val
             no_improve_epochs = 0
-            torch.save(decoder.state_dict(), "best_decoder.pt")
-            print(f"✅ 验证集 F1 提升为 {f1_val:.4f}，保存当前模型为 best_decoder.pt")
+            torch.save({
+                "encoder": model.state_dict(),
+                "ddfn": ddfn.state_dict(),
+                "decoder": decoder.state_dict(),
+                "label_map": getattr(train_dataset, "label_map", None)
+            }, "best_ckpt.pt")
+            print(f"✅ 验证集 F1 提升为 {f1_val:.4f}，保存当前模型为 best_ckpt.pt")
+
+
         else:
             no_improve_epochs += 1
             print(f"⚠️ 验证集 F1 未提升，已连续 {no_improve_epochs} 次")
@@ -245,11 +283,12 @@ def main(opt):
         fig, ax = plt.subplots(figsize=(6, 6))
         disp = ConfusionMatrixDisplay(confusion_matrix=cm)
         disp.plot(ax=ax)
-        plt.close(fig)  # 避免多余图像弹出
+
 
         # TensorBoard 写入图像
         if opt.tensorboard_log:
             writer.add_figure("ConfusionMatrix/val", fig, epoch)
+        plt.close(fig)  # 避免多余图像弹出
 
         avg_val_loss = val_loss / len(val_loader)
 
@@ -277,9 +316,50 @@ def main(opt):
 
     # 保存训练后的 Decoder 权重
     torch.save(decoder.state_dict(), "decoder_model.pt")
+
     print("✅ 训练完成，Decoder 权重已保存为 decoder_model.pt")
+    if opt.split_by_time:
+        from sklearn.metrics import accuracy_score, f1_score, classification_report
+        ckpt = torch.load("best_ckpt.pt", map_location=device)
+        model.load_state_dict(ckpt["encoder"], strict=False)
+        ddfn.load_state_dict(ckpt["ddfn"])
+        decoder.load_state_dict(ckpt["decoder"])
+        model.eval();
+        ddfn.eval();
+        decoder.eval()
+
+        ys, ps = [], []
+        with torch.no_grad():
+            for x, y in test_loader:
+                x, y = x.to(device), y.to(device)
+                feats = model(x, return_features=True)
+                out = decoder(ddfn(feats))
+                ps.append(out.argmax(1).cpu().numpy())
+                ys.append(y.cpu().numpy())
+
+        import numpy as np
+        y_true = np.concatenate(ys);
+        y_pred = np.concatenate(ps)
+        acc = accuracy_score(y_true, y_pred)
+        f1m = f1_score(y_true, y_pred, average="macro")
+        print(f"[TEST] acc={acc:.4f}  f1_macro={f1m:.4f}")
+        print(classification_report(y_true, y_pred, digits=4))
+
     # ✅ 训练完成后
     print("✅ 训练完成，Decoder 权重已保存为 decoder_model.pt")
+
+    # =======================
+    # 🎯 训练结束提示信息
+    # =======================
+    if os.path.exists("best_ckpt.pt"):
+        print("\n✅ 训练结束，最优模型已保存为：best_ckpt.pt")
+        print("👉 你可以在测试或预测脚本中通过以下方式加载：")
+        print("    ckpt = torch.load('best_ckpt.pt', map_location=device)")
+        print("    encoder.load_state_dict(ckpt['encoder'])")
+        print("    ddfn.load_state_dict(ckpt['ddfn'])")
+        print("    decoder.load_state_dict(ckpt['decoder'])")
+    else:
+        print("\n⚠️ 警告：未找到 best_ckpt.pt，请检查 EarlyStopping 或保存逻辑是否执行。")
 
     # # ✅ 自动调用推理模块
     # import subprocess
