@@ -6,34 +6,10 @@ import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
-# ========== 强制WandB纯离线模式 ==========
-# 彻底禁用所有网络连接，但保留本地记录功能
-os.environ["WANDB_MODE"] = "offline"
-os.environ["WANDB_API_KEY"] = "fake_key"
-os.environ["WANDB_SILENT"] = "true"  # 减少输出
-os.environ["WANDB_DISABLE_CODE"] = "true"  # 禁用代码保存
-os.environ["WANDB_DISABLE_GIT"] = "true"   # 禁用Git集成
 
-import wandb
 
-# 创建完全离线的配置
-offline_settings = wandb.Settings(
-    disable_networking=True,  # 完全禁用网络
-    _disable_meta=True,       # 禁止收集系统信息
-    _disable_stats=True,      # 禁用统计收集
-    start_method="thread",     # 避免多进程问题
-    save_code=False,           # 不保存代码
-    console="off"             # 关闭控制台输出
-)
 
-# ✅ 初始化WandB（纯离线模式，但保留本地记录）
-run = wandb.init(
-    project="RUL迁移学习",
-    name="测试推理",
-    mode="offline",           # 明确指定离线模式
-    settings=offline_settings
-)
-print("✅ WandB已初始化为离线模式，将只进行本地记录")
+
 
 
 
@@ -52,7 +28,6 @@ import numpy as np
 from datetime import datetime
 
 from sklearn.metrics import classification_report
-import wandb
 
 
 from datetime import datetime  # 导入时间模块
@@ -65,9 +40,7 @@ NUM_CLASSES = 8
 WINDOW_SIZE = 60
 STRIDE = 20
 
-# ✅ 设置 WandB 离线模式
-os.environ["WANDB_MODE"] = "offline"
-wandb.init(project="RUL迁移学习", name="测试推理")
+
 
 # ========== 加载模型 ==========
 encoder = BiLSTMEncoder(input_size=8).to(DEVICE)
@@ -151,28 +124,13 @@ log_confusion_matrix_tensorboard(y_true, y_pred, class_names, writer)
 # 计算并输出分类报告（字典格式）
 report = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
 
-# ✅ 转为 WandB 表格记录
-table = wandb.Table(columns=["Class", "Precision", "Recall", "F1-score", "Support"])
-for cls_name, metrics in report.items():
-    if cls_name in class_names:  # 排除 'accuracy', 'macro avg' 等
-        table.add_data(
-            cls_name,
-            round(metrics["precision"], 4),
-            round(metrics["recall"], 4),
-            round(metrics["f1-score"], 4),
-            int(metrics["support"])
-        )
 
-# ✅ 记录到 WandB（将出现在 Panels > Table 中）
-wandb.log({"Per-class metrics": table})
+
+
 
 writer.close()
 
-# ========== WandB 记录 ==========
-wandb.log({
-    "test/accuracy": acc,
-    "test/f1": f1
-})
+
 
 # 可视化混淆矩阵
 plt.figure(figsize=(8, 6))
@@ -186,9 +144,6 @@ plt.title("Confusion Matrix")
 plt.savefig(logdir)
 plt.close()
 
-# # 保存图像并上传到 WandB
-# plt.savefig("confusion_matrix.png")
-# wandb.log({"confusion_matrix": wandb.Image("confusion_matrix.png")})
 
-print("\n✅ 推理完成，指标已记录 WandB（本地模式）。")
+
 
