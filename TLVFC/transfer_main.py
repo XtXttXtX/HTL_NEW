@@ -1,7 +1,12 @@
 import torch
+import seaborn as sns
+
 import argparse
 from models.bilstm_encoder import BiLSTMEncoder
-from torch.utils.data import DataLoader,Subset
+from torch.utils.data import DataLoader, Subset, random_split
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+
+
 from dataset_railway import RailwayDataset
 from models.ddfn import DDFN  # 我们后面要补充 DDFN
 from models.decoder import Decoder  # 我们后面要补充 Decoder
@@ -11,10 +16,7 @@ from dataset_windowed import WindowedRailwayDataset
 from collections import Counter
 
 
-from sklearn.model_selection import train_test_split
-from torch.utils.data import Subset
 
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 
 import os
@@ -104,36 +106,65 @@ def main(opt):
             split_by_time=True,
             ratios=tuple(opt.ratios)
         )
+        test_dataset = WindowedRailwayDataset(
+            data_dir=opt.data_path,
+            fault_range_file="fault_ranges.xlsx",
+            window_size=60,
+            stride=20,
+            split="test",
+            split_by_time=True,
+            ratios=tuple(opt.ratios)
+        )
+
+        # === 为时间划分模式创建 DataLoader ===
+        train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False)
+        test_loader = DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False)
+
     else:
-        print("🎲 使用原始随机划分方式 ...")
-        # 原逻辑保持不变
+        print("🎲 使用原始随机划分方式 (6:2:2) ...")
+        import random, numpy as np
+
+        # 1️⃣ 固定随机种子
+        def set_seed(seed=42):
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+        set_seed(42)
+
+        # 2️⃣ 构造完整数据集
         railway_dataset = WindowedRailwayDataset(
             data_dir=opt.data_path,
             fault_range_file="fault_ranges.xlsx",
             window_size=60,
             stride=20
         )
-        # 按标签分层随机划分
-        # === 仅在随机划分路径（else 分支）里使用 ===
 
-        # 1) 取全部样本索引与标签（避免与批内的 labels 重名，换个名字）
-        indices = list(range(len(railway_dataset)))
-        labels_all = railway_dataset.labels
+        # 3️⃣ 按 6:2:2 划分并保存索引
+        N = len(railway_dataset)
+        n_train = int(0.6 * N)
+        n_val = int(0.2 * N)
+        n_test = N - n_train - n_val
+        g = torch.Generator().manual_seed(42)
+        train_ds, val_ds, test_ds = random_split(railway_dataset, [n_train, n_val, n_test], generator=g)
 
-        # 2) 分层随机划分
-        #   （如果已在文件顶部 import 过，就把这两行 import 去掉）
-        from sklearn.model_selection import train_test_split
-        train_idx, val_idx = train_test_split(
-            indices, test_size=0.2, stratify=labels_all, random_state=42
-        )
+        np.savez("split_idx.npz",
+                 train_idx=np.array(train_ds.indices),
+                 val_idx=np.array(val_ds.indices),
+                 test_idx=np.array(test_ds.indices))
+        print(f"✅ 已保存划分索引 split_idx.npz (train/val/test = {len(train_ds)}/{len(val_ds)}/{len(test_ds)})")
 
-        # 3) 构建子集作为数据集（注意：这里就直接叫 train_dataset / val_dataset）
-        from torch.utils.data import Subset
-        train_dataset = Subset(railway_dataset, train_idx)
-        val_dataset = Subset(railway_dataset, val_idx)
+        # 4️⃣ 创建 DataLoader
+        train_loader = DataLoader(train_ds, batch_size=opt.batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=opt.batch_size, shuffle=False)
+        test_loader = DataLoader(test_ds, batch_size=opt.batch_size, shuffle=False)
 
-        # 4) 随机划分路径没有 test 集，明确置空，后面评估时可判空
-        test_dataset = None
+        # 5️⃣ 记录数据分布
+        train_dataset, val_dataset, test_dataset = train_ds, val_ds, test_ds
 
     #初始化 EarlyStopping 状态变量
     best_val_f1 = 0.0  # 当前观察到的最佳验证集 F1
@@ -170,23 +201,9 @@ def main(opt):
 
 
 
-    train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False)
 
-    # 加入test数据加载，这样在训练结束后能直接在test_loader上评估最终性能
-    # 如果启用了 split-by-time，可以直接构建 test_dataset
-    if opt.split_by_time:
-        test_dataset = WindowedRailwayDataset(
-            data_dir=opt.data_path,
-            fault_range_file="fault_ranges.xlsx",
-            window_size=60,
-            stride=20,
-            split="test",
-            split_by_time=True,
-            ratios=tuple(opt.ratios)
-        )
-        test_loader = DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False)
-        print(f"✅ 测试集样本数: {len(test_dataset)}")
+
+
 
     # 创建 DDFN 模块（特征对齐）
     ddfn = DDFN().to(device)
@@ -279,16 +296,23 @@ def main(opt):
                 break
 
         # 绘制混淆矩阵
-        cm = confusion_matrix(val_labels, val_preds)
-        fig, ax = plt.subplots(figsize=(6, 6))
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-        disp.plot(ax=ax)
+        disp = ConfusionMatrixDisplay.from_predictions(
+            val_labels, val_preds,
+            labels=list(range(8)),
+            cmap="Blues",
+            normalize=None
+        )
+        fig = disp.figure_
+        fig.set_size_inches(6, 6)
+        disp.ax_.set_xlabel("Predicted label")
+        disp.ax_.set_ylabel("True label")
+        disp.ax_.set_title(f"Confusion Matrix (VAL) epoch={epoch + 1}")
 
-
-        # TensorBoard 写入图像
         if opt.tensorboard_log:
-            writer.add_figure("ConfusionMatrix/val", fig, epoch)
-        plt.close(fig)  # 避免多余图像弹出
+            writer.add_figure("ConfusionMatrix/val", fig, epoch + 1)
+        plt.close(fig)
+
+
 
         avg_val_loss = val_loss / len(val_loader)
 
@@ -315,10 +339,15 @@ def main(opt):
             f"Epoch {epoch + 1}/{opt.epochs} - Train Loss: {avg_loss:.4f} - Val Acc: {acc_val:.4f} - Val F1: {f1_val:.4f}")
 
     # 保存训练后的 Decoder 权重
+    # 保存三段权重，供 predict.py 使用
+    torch.save(model.state_dict(), "encoder.pt")
+    torch.save(ddfn.state_dict(), "ddfn.pt")
     torch.save(decoder.state_dict(), "decoder_model.pt")
 
+    print("✅ 训练完成，已保存 encoder.pt / ddfn.pt / decoder_model.pt")
+
     print("✅ 训练完成，Decoder 权重已保存为 decoder_model.pt")
-    if opt.split_by_time:
+    if test_dataset is not None:
         from sklearn.metrics import accuracy_score, f1_score, classification_report
         ckpt = torch.load("best_ckpt.pt", map_location=device)
         model.load_state_dict(ckpt["encoder"], strict=False)
@@ -338,12 +367,35 @@ def main(opt):
                 ys.append(y.cpu().numpy())
 
         import numpy as np
-        y_true = np.concatenate(ys);
+        y_true = np.concatenate(ys)
         y_pred = np.concatenate(ps)
         acc = accuracy_score(y_true, y_pred)
         f1m = f1_score(y_true, y_pred, average="macro")
         print(f"[TEST] acc={acc:.4f}  f1_macro={f1m:.4f}")
         print(classification_report(y_true, y_pred, digits=4))
+        if opt.tensorboard_log:
+            writer.add_scalar("Accuracy/test", acc, 0)
+            writer.add_scalar("F1/test", f1m, 0)
+            writer.flush()
+
+        # ===== 绘制并写入测试集混淆矩阵（最稳妥：from_predictions）=====
+
+
+        disp = ConfusionMatrixDisplay.from_predictions(
+            y_true, y_pred,  # ← 用测试集的 y_true / y_pred
+            labels=list(range(8)),
+            cmap="Blues",
+            normalize=None  # 想看百分比就改成 "true"
+        )
+        fig = disp.figure_
+        fig.set_size_inches(6, 6)
+        disp.ax_.set_xlabel("Predicted label")
+        disp.ax_.set_ylabel("True label")
+        disp.ax_.set_title("Confusion Matrix (TEST)")
+
+        if opt.tensorboard_log:
+            writer.add_figure("ConfusionMatrix/test", fig)  # ← 写到 test
+        plt.close(fig)
 
     # ✅ 训练完成后
     print("✅ 训练完成，Decoder 权重已保存为 decoder_model.pt")

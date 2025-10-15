@@ -23,7 +23,7 @@ from models.decoder_full import DecoderFull
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import numpy as np
 from datetime import datetime
 
@@ -47,8 +47,14 @@ encoder = BiLSTMEncoder(input_size=8).to(DEVICE)
 ddfn = DDFN().to(DEVICE)
 decoder = DecoderFull(input_size=128, num_classes=NUM_CLASSES).to(DEVICE)
 
-# ✅ 加载你保存的 decoder 权重
-decoder.load_state_dict(torch.load("decoder_model.pt", map_location=DEVICE))
+# ✅ 从 best_ckpt.pt 一次性加载三段权重
+ckpt = torch.load("best_ckpt.pt", map_location=DEVICE)
+encoder.load_state_dict(ckpt["encoder"])
+ddfn.load_state_dict(ckpt["ddfn"])
+decoder.load_state_dict(ckpt["decoder"])
+print("✅ 已从 best_ckpt.pt 加载 encoder / ddfn / decoder 权重")
+
+
 
 # ❗ 如果 encoder 和 ddfn 是冻结状态，也可以加载训练中保存的（可选）
 encoder.eval()
@@ -56,13 +62,34 @@ ddfn.eval()
 decoder.eval()
 
 # ========== 加载数据 ==========
-test_dataset = WindowedRailwayDataset(
+from torch.utils.data import Subset
+
+# 加载完整数据集（保持一致的路径和参数）
+full_dataset = WindowedRailwayDataset(
     data_dir="分类数据",  # 替换为你的实际路径
     fault_range_file="fault_ranges.xlsx",
     window_size=WINDOW_SIZE,
     stride=STRIDE
 )
+
+# ✅ 从保存的 split_idx.npz 中加载测试集索引
+# === 如果训练时用了 --split-by-time，这里也要用同样的时间划分 ===
+test_dataset = WindowedRailwayDataset(
+    data_dir="分类数据",                 # ⚠️ 改成你自己的数据路径
+    fault_range_file="fault_ranges.xlsx",
+    window_size=60,
+    stride=20,
+    split="test",
+    split_by_time=True,                # ⚠️ 一定要加这个
+    ratios=(0.6, 0.2, 0.2)             # ⚠️ 跟训练时的比例保持一致
+)
+
+
+# ✅ 创建 DataLoader
 test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+print(f"✅ 已加载测试集，仅包含 {len(test_dataset)} 条样本（来自 split_idx.npz）")
+
 
 # ========== 推理 ==========
 all_preds = []
@@ -82,15 +109,17 @@ with torch.no_grad():
         all_labels.append(y.cpu().numpy())
 
 def log_confusion_matrix_tensorboard(y_true, y_pred, class_names, writer, global_step=0):
-    cm = confusion_matrix(y_true, y_pred)
-    fig, ax = plt.subplots(figsize=(6, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=class_names, yticklabels=class_names, ax=ax)
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
-    ax.set_title("Confusion Matrix")
-    plt.tight_layout()
-    writer.add_figure("ConfusionMatrix", fig, global_step=global_step)
+    # ✅ 更稳妥：用 from_predictions（不会把 y_true/y_pred 搞反）
+    disp = ConfusionMatrixDisplay.from_predictions(
+        y_true, y_pred, labels=range(8), cmap="Blues", normalize=None
+    )
+    fig = disp.figure_
+    fig.set_size_inches(6, 6)
+    disp.ax_.set_xlabel("Predicted label")
+    disp.ax_.set_ylabel("True label")
+
+    if opt.tensorboard_log:
+        writer.add_figure("ConfusionMatrix/test", fig)
     plt.close(fig)
 
 
